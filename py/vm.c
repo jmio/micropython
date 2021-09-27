@@ -285,6 +285,9 @@ outer_dispatch_loop:
             // loop to execute byte code
             for (;;) {
 dispatch_loop:
+#if RV32_VM_BREAK
+            	MP_RV32_BREAK();
+#endif
 #if MICROPY_OPT_COMPUTED_GOTO
                 DISPATCH();
 #else
