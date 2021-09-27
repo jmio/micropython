@@ -61,10 +61,18 @@ SRC_C = \
 	mphalport.c \
 	moduos.c \
 	fatfs_port.c \
+	shared/libc/printf.c \
+	shared/readline/readline.c \
+	shared/runtime/pyexec.c \
+	shared/runtime/stdout_helpers.c \
+	shared/runtime/interrupt_char.c \
+	shared/runtime/sys_stdio_mphal.c \
+	shared/timeutils/timeutils.c \
 
+#	$(BUILD)/_frozen_mpy.c \
 
 ifeq ($(CROSS), 1)
-SRC_C += lib/libc/string0.c
+SRC_C += shared/libc/string0.c
 endif
 
 SRC_S = start.S
@@ -73,12 +81,6 @@ SRC_S = start.S
 SRC_LIB += $(addprefix lib/,\
 	oofatfs/ff.c \
 	oofatfs/ffunicode.c \
-	utils/printf.c \
-	utils/stdout_helpers.c \
-	utils/sys_stdio_mphal.c \
-	utils/interrupt_char.c \
-	utils/pyexec.c \
-	libc/string0.c \
 	libm/math.c \
 	libm/fmodf.c \
 	libm/nearbyintf.c \
@@ -105,8 +107,6 @@ SRC_LIB += $(addprefix lib/,\
 	libm/asinfacosf.c \
 	libm/atanf.c \
 	libm/atan2f.c \
-	mp-readline/readline.c \
-	timeutils/timeutils.c \
 	)
 
 

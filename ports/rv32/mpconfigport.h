@@ -178,4 +178,4 @@ typedef long mp_off_t;
 
 /* !!! THIS IS MACHINE DEPENDENT PART !!! */
 #define MP_MURAX_UART_STATUS      (*(uint32_t *)(0xF0010004))
-#define MP_RV32_BREAK() { if ((MP_MURAX_UART_STATUS >> 24) != 0) mp_keyboard_interrupt(); } // vm.c (patched)
+#define MP_RV32_BREAK() { if ((MP_MURAX_UART_STATUS >> 24) != 0) mp_sched_keyboard_interrupt(); } // vm.c (patched)
