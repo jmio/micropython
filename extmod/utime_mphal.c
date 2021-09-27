@@ -48,7 +48,7 @@ MP_DEFINE_CONST_FUN_OBJ_1(mp_utime_sleep_obj, time_sleep);
 
 STATIC mp_obj_t time_sleep_ms(mp_obj_t arg) {
     mp_int_t ms = mp_obj_get_int(arg);
-    if (ms > 0) {
+    if (ms >= 0) {
         mp_hal_delay_ms(ms);
     }
     return mp_const_none;
@@ -98,5 +98,11 @@ STATIC mp_obj_t time_ticks_add(mp_obj_t ticks_in, mp_obj_t delta_in) {
     return MP_OBJ_NEW_SMALL_INT((ticks + delta) & (MICROPY_PY_UTIME_TICKS_PERIOD - 1));
 }
 MP_DEFINE_CONST_FUN_OBJ_2(mp_utime_ticks_add_obj, time_ticks_add);
+
+// Returns the number of nanoseconds since the Epoch, as an integer.
+STATIC mp_obj_t time_time_ns(void) {
+    return mp_obj_new_int_from_ull(mp_hal_time_ns());
+}
+MP_DEFINE_CONST_FUN_OBJ_0(mp_utime_time_ns_obj, time_time_ns);
 
 #endif // MICROPY_PY_UTIME_MP_HAL

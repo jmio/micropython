@@ -34,13 +34,27 @@ import subprocess
 # Public functions to be used in the manifest
 
 
-def include(manifest):
+def include(manifest, **kwargs):
     """Include another manifest.
 
     The manifest argument can be a string (filename) or an iterable of
     strings.
 
     Relative paths are resolved with respect to the current manifest file.
+
+    Optional kwargs can be provided which will be available to the
+    included script via the `options` variable.
+
+    e.g. include("path.py", extra_features=True)
+
+    in path.py:
+        options.defaults(standard_features=True)
+
+        # freeze minimal modules.
+        if options.standard_features:
+            # freeze standard modules.
+        if options.extra_features:
+            # freeze extra modules.
     """
 
     if not isinstance(manifest, str):
@@ -53,7 +67,7 @@ def include(manifest):
             # Applies to includes and input files.
             prev_cwd = os.getcwd()
             os.chdir(os.path.dirname(manifest))
-            exec(f.read())
+            exec(f.read(), globals(), {"options": IncludeOptions(**kwargs)})
             os.chdir(prev_cwd)
 
 
@@ -76,9 +90,10 @@ def freeze(path, script=None, opt=0):
     If `script` is an iterable then freeze() is called on all items of the
     iterable (with the same `path` and `opt` passed through).
 
-    If `script` is a string then it specifies the filename to freeze, and
-    can include extra directories before the file.  The file will be
-    searched for in `path`.
+    If `script` is a string then it specifies the file or directory to
+    freeze, and can include extra directories before the file or last
+    directory.  The file or directory will be searched for in `path`.  If
+    `script` is a directory then all files in that directory will be frozen.
 
     `opt` is the optimisation level to pass to mpy-cross when compiling .py
     to .mpy.
@@ -124,6 +139,18 @@ VARS = {}
 manifest_list = []
 
 
+class IncludeOptions:
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+        self._defaults = {}
+
+    def defaults(self, **kwargs):
+        self._defaults = kwargs
+
+    def __getattr__(self, name):
+        return self._kwargs.get(name, self._defaults.get(name, None))
+
+
 class FreezeError(Exception):
     pass
 
@@ -163,33 +190,36 @@ def get_timestamp_newest(path):
     return ts_newest
 
 
-def mkdir(path):
-    cur_path = ""
-    for p in path.split("/")[:-1]:
-        cur_path += p + "/"
-        try:
-            os.mkdir(cur_path)
-        except OSError as er:
-            if er.args[0] == 17:  # file exists
-                pass
-            else:
-                raise er
+def mkdir(filename):
+    path = os.path.dirname(filename)
+    if not os.path.isdir(path):
+        os.makedirs(path)
 
 
 def freeze_internal(kind, path, script, opt):
     path = convert_path(path)
+    if not os.path.isdir(path):
+        raise FreezeError("freeze path must be a directory: {}".format(path))
     if script is None and kind == KIND_AS_STR:
         if any(f[0] == KIND_AS_STR for f in manifest_list):
             raise FreezeError("can only freeze one str directory")
         manifest_list.append((KIND_AS_STR, path, script, opt))
-    elif script is None:
-        for dirpath, dirnames, filenames in os.walk(path, followlinks=True):
+    elif script is None or isinstance(script, str) and script.find(".") == -1:
+        # Recursively search `path` for files to freeze, optionally restricted
+        # to a subdirectory specified by `script`
+        if script is None:
+            subdir = ""
+        else:
+            subdir = "/" + script
+        for dirpath, dirnames, filenames in os.walk(path + subdir, followlinks=True):
             for f in filenames:
                 freeze_internal(kind, path, (dirpath + "/" + f)[len(path) + 1 :], opt)
     elif not isinstance(script, str):
+        # `script` is an iterable of items to freeze
         for s in script:
             freeze_internal(kind, path, s, opt)
     else:
+        # `script` should specify an individual file to be frozen
         extension_kind = {KIND_AS_MPY: ".py", KIND_MPY: ".mpy"}
         if kind == KIND_AUTO:
             for k, ext in extension_kind.items():
@@ -218,6 +248,7 @@ def main():
         "-f", "--mpy-cross-flags", default="", help="flags to pass to mpy-cross"
     )
     cmd_parser.add_argument("-v", "--var", action="append", help="variables to substitute")
+    cmd_parser.add_argument("--mpy-tool-flags", default="", help="flags to pass to mpy-tool")
     cmd_parser.add_argument("files", nargs="+", help="input manifest list")
     args = cmd_parser.parse_args()
 
@@ -278,7 +309,8 @@ def main():
                     + ["-o", outfile, "-s", script, "-O{}".format(opt), infile]
                 )
                 if res != 0:
-                    print("error compiling {}: {}".format(infile, out))
+                    print("error compiling {}:".format(infile))
+                    sys.stdout.buffer.write(out)
                     raise SystemExit(1)
                 ts_outfile = get_timestamp(outfile)
             mpy_files.append(outfile)
@@ -310,6 +342,7 @@ def main():
                 "-q",
                 args.build_dir + "/genhdr/qstrdefs.preprocessed.h",
             ]
+            + args.mpy_tool_flags.split()
             + mpy_files
         )
         if res != 0:
@@ -324,7 +357,7 @@ def main():
             b"    (qstr_pool_t*)&mp_qstr_const_pool, MP_QSTRnumber_of, 0, 0\n"
             b"};\n"
             b'const char mp_frozen_mpy_names[1] = {"\\0"};\n'
-            b"const mp_raw_code_t *const mp_frozen_mpy_content[0] = {};\n"
+            b"const mp_raw_code_t *const mp_frozen_mpy_content[1] = {NULL};\n"
         )
 
     # Generate output

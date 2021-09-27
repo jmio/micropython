@@ -132,14 +132,6 @@ def mp_opcode_format(bytecode, ip, count_var_uint):
     ip_start = ip
     f = (0x000003A4 >> (2 * ((opcode) >> 4))) & 3
     if f == MP_BC_FORMAT_QSTR:
-        if config.MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE:
-            if (
-                opcode == MP_BC_LOAD_NAME
-                or opcode == MP_BC_LOAD_GLOBAL
-                or opcode == MP_BC_LOAD_ATTR
-                or opcode == MP_BC_STORE_ATTR
-            ):
-                ip += 1
         ip += 3
     else:
         extra_byte = (opcode & MP_BC_MASK_EXTRA_BYTE) == 0
@@ -253,6 +245,7 @@ class RawCode(object):
             self.ip, self.ip2, self.prelude = extract_prelude(self.bytecode, self.prelude_offset)
             self.simple_name = self._unpack_qstr(self.ip2)
             self.source_file = self._unpack_qstr(self.ip2 + 2)
+            self.line_info_offset = self.ip2 + 4
 
     def _unpack_qstr(self, ip):
         qst = self.bytecode[ip] | self.bytecode[ip + 1] << 8
@@ -404,7 +397,10 @@ class RawCode(object):
             print("        .n_def_pos_args = %u," % self.prelude[5])
             print("        .qstr_block_name = %s," % self.simple_name.qstr_id)
             print("        .qstr_source_file = %s," % self.source_file.qstr_id)
-            print("        .line_info = fun_data_%s + %u," % (self.escaped_name, 0))  # TODO
+            print(
+                "        .line_info = fun_data_%s + %u,"
+                % (self.escaped_name, self.line_info_offset)
+            )
             print("        .opcodes = fun_data_%s + %u," % (self.escaped_name, self.ip))
             print("    },")
             print("    .line_of_definition = %u," % 0)  # TODO
@@ -436,10 +432,7 @@ class RawCodeBytecode(RawCode):
             "// frozen bytecode for file %s, scope %s%s"
             % (self.source_file.str, parent_name, self.simple_name.str)
         )
-        print("STATIC ", end="")
-        if not config.MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE:
-            print("const ", end="")
-        print("byte fun_data_%s[%u] = {" % (self.escaped_name, len(self.bytecode)))
+        print("STATIC const byte fun_data_%s[%u] = {" % (self.escaped_name, len(self.bytecode)))
         print("   ", end="")
         for i in range(self.ip2):
             print(" 0x%02x," % self.bytecode[i], end="")
@@ -528,6 +521,7 @@ class RawCodeNative(RawCode):
             if config.native_arch in (
                 MP_NATIVE_ARCH_X86,
                 MP_NATIVE_ARCH_X64,
+                MP_NATIVE_ARCH_ARMV6,
                 MP_NATIVE_ARCH_XTENSA,
                 MP_NATIVE_ARCH_XTENSAWIN,
             ):
@@ -793,7 +787,6 @@ def read_mpy(filename):
             raise Exception("incompatible .mpy version")
         feature_byte = header[2]
         qw_size = read_uint(f)
-        config.MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE = (feature_byte & 1) != 0
         config.MICROPY_PY_BUILTINS_STR_UNICODE = (feature_byte & 2) != 0
         mpy_native_arch = feature_byte >> 2
         if mpy_native_arch != MP_NATIVE_ARCH_NONE:
@@ -829,14 +822,6 @@ def freeze_mpy(base_qstrs, raw_codes):
     print('#include "py/objstr.h"')
     print('#include "py/emitglue.h"')
     print('#include "py/nativeglue.h"')
-    print()
-
-    print(
-        "#if MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE != %u"
-        % config.MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE
-    )
-    print('#error "incompatible MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE"')
-    print("#endif")
     print()
 
     print("#if MICROPY_LONGINT_IMPL != %u" % config.MICROPY_LONGINT_IMPL)
@@ -912,6 +897,17 @@ def freeze_mpy(base_qstrs, raw_codes):
         print("    &raw_code_%s," % rc.escaped_name)
     print("};")
 
+    # If a port defines MICROPY_FROZEN_LIST_ITEM then list all modules wrapped in that macro.
+    print("#ifdef MICROPY_FROZEN_LIST_ITEM")
+    for rc in raw_codes:
+        module_name = rc.source_file.str
+        if module_name.endswith("/__init__.py"):
+            short_name = module_name[: -len("/__init__.py")]
+        else:
+            short_name = module_name[: -len(".py")]
+        print('MICROPY_FROZEN_LIST_ITEM("%s", "%s")' % (short_name, module_name))
+    print("#endif")
+
 
 def merge_mpy(raw_codes, output_file):
     assert len(raw_codes) <= 31  # so var-uints all fit in 1 byte
@@ -924,17 +920,13 @@ def merge_mpy(raw_codes, output_file):
         header = bytearray(5)
         header[0] = ord("M")
         header[1] = config.MPY_VERSION
-        header[2] = (
-            config.native_arch << 2
-            | config.MICROPY_PY_BUILTINS_STR_UNICODE << 1
-            | config.MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE
-        )
+        header[2] = config.native_arch << 2 | config.MICROPY_PY_BUILTINS_STR_UNICODE << 1
         header[3] = config.mp_small_int_bits
         header[4] = 32  # qstr_win_size
         merged_mpy.extend(header)
 
         bytecode = bytearray()
-        bytecode_len = 6 + len(raw_codes) * 4 + 2
+        bytecode_len = 6 + len(raw_codes) * 5 + 2
         bytecode.append(bytecode_len << 2)  # kind and length
         bytecode.append(0b00000000)  # signature prelude
         bytecode.append(0b00001000)  # size prelude
@@ -943,7 +935,7 @@ def merge_mpy(raw_codes, output_file):
         for idx in range(len(raw_codes)):
             bytecode.append(0x32)  # MP_BC_MAKE_FUNCTION
             bytecode.append(idx)  # index raw code
-            bytecode.extend(b"\x34\x00")  # MP_BC_CALL_FUNCTION, 0 args
+            bytecode.extend(b"\x34\x00\x59")  # MP_BC_CALL_FUNCTION, 0 args, MP_BC_POP_TOP
         bytecode.extend(b"\x51\x63")  # MP_BC_LOAD_NONE, MP_BC_RETURN_VALUE
 
         bytecode.append(0)  # n_obj

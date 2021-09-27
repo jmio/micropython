@@ -55,9 +55,6 @@
 #define RULE_ARG_RULE           (0x2000)
 #define RULE_ARG_OPT_RULE       (0x3000)
 
-// (un)comment to use rule names; for debugging
-// #define USE_RULE_NAME (1)
-
 // *FORMAT-OFF*
 
 enum {
@@ -192,7 +189,7 @@ static const size_t FIRST_RULE_WITH_OFFSET_ABOVE_255 =
 #undef DEF_RULE_NC
 0;
 
-#if USE_RULE_NAME
+#if MICROPY_DEBUG_PARSE_RULE_NAME
 // Define an array of rule names corresponding to each rule
 STATIC const char *const rule_name_table[] = {
 #define DEF_RULE(rule, comp, kind, ...) #rule,
@@ -368,35 +365,35 @@ size_t mp_parse_node_extract_list(mp_parse_node_t *pn, size_t pn_kind, mp_parse_
 }
 
 #if MICROPY_DEBUG_PRINTERS
-void mp_parse_node_print(mp_parse_node_t pn, size_t indent) {
+void mp_parse_node_print(const mp_print_t *print, mp_parse_node_t pn, size_t indent) {
     if (MP_PARSE_NODE_IS_STRUCT(pn)) {
-        printf("[% 4d] ", (int)((mp_parse_node_struct_t *)pn)->source_line);
+        mp_printf(print, "[% 4d] ", (int)((mp_parse_node_struct_t *)pn)->source_line);
     } else {
-        printf("       ");
+        mp_printf(print, "       ");
     }
     for (size_t i = 0; i < indent; i++) {
-        printf(" ");
+        mp_printf(print, " ");
     }
     if (MP_PARSE_NODE_IS_NULL(pn)) {
-        printf("NULL\n");
+        mp_printf(print, "NULL\n");
     } else if (MP_PARSE_NODE_IS_SMALL_INT(pn)) {
         mp_int_t arg = MP_PARSE_NODE_LEAF_SMALL_INT(pn);
-        printf("int(" INT_FMT ")\n", arg);
+        mp_printf(print, "int(" INT_FMT ")\n", arg);
     } else if (MP_PARSE_NODE_IS_LEAF(pn)) {
         uintptr_t arg = MP_PARSE_NODE_LEAF_ARG(pn);
         switch (MP_PARSE_NODE_LEAF_KIND(pn)) {
             case MP_PARSE_NODE_ID:
-                printf("id(%s)\n", qstr_str(arg));
+                mp_printf(print, "id(%s)\n", qstr_str(arg));
                 break;
             case MP_PARSE_NODE_STRING:
-                printf("str(%s)\n", qstr_str(arg));
+                mp_printf(print, "str(%s)\n", qstr_str(arg));
                 break;
             case MP_PARSE_NODE_BYTES:
-                printf("bytes(%s)\n", qstr_str(arg));
+                mp_printf(print, "bytes(%s)\n", qstr_str(arg));
                 break;
             default:
                 assert(MP_PARSE_NODE_LEAF_KIND(pn) == MP_PARSE_NODE_TOKEN);
-                printf("tok(%u)\n", (uint)arg);
+                mp_printf(print, "tok(%u)\n", (uint)arg);
                 break;
         }
     } else {
@@ -404,19 +401,19 @@ void mp_parse_node_print(mp_parse_node_t pn, size_t indent) {
         mp_parse_node_struct_t *pns = (mp_parse_node_struct_t *)pn;
         if (MP_PARSE_NODE_STRUCT_KIND(pns) == RULE_const_object) {
             #if MICROPY_OBJ_REPR == MICROPY_OBJ_REPR_D
-            printf("literal const(%016llx)\n", (uint64_t)pns->nodes[0] | ((uint64_t)pns->nodes[1] << 32));
+            mp_printf(print, "literal const(%016llx)\n", (uint64_t)pns->nodes[0] | ((uint64_t)pns->nodes[1] << 32));
             #else
-            printf("literal const(%p)\n", (mp_obj_t)pns->nodes[0]);
+            mp_printf(print, "literal const(%p)\n", (mp_obj_t)pns->nodes[0]);
             #endif
         } else {
             size_t n = MP_PARSE_NODE_STRUCT_NUM_NODES(pns);
-            #if USE_RULE_NAME
-            printf("%s(%u) (n=%u)\n", rule_name_table[MP_PARSE_NODE_STRUCT_KIND(pns)], (uint)MP_PARSE_NODE_STRUCT_KIND(pns), (uint)n);
+            #if MICROPY_DEBUG_PARSE_RULE_NAME
+            mp_printf(print, "%s(%u) (n=%u)\n", rule_name_table[MP_PARSE_NODE_STRUCT_KIND(pns)], (uint)MP_PARSE_NODE_STRUCT_KIND(pns), (uint)n);
             #else
-            printf("rule(%u) (n=%u)\n", (uint)MP_PARSE_NODE_STRUCT_KIND(pns), (uint)n);
+            mp_printf(print, "rule(%u) (n=%u)\n", (uint)MP_PARSE_NODE_STRUCT_KIND(pns), (uint)n);
             #endif
             for (size_t i = 0; i < n; i++) {
-                mp_parse_node_print(pns->nodes[i], indent + 2);
+                mp_parse_node_print(print, pns->nodes[i], indent + 2);
             }
         }
     }
@@ -424,10 +421,10 @@ void mp_parse_node_print(mp_parse_node_t pn, size_t indent) {
 #endif // MICROPY_DEBUG_PRINTERS
 
 /*
-STATIC void result_stack_show(parser_t *parser) {
-    printf("result stack, most recent first\n");
+STATIC void result_stack_show(const mp_print_t *print, parser_t *parser) {
+    mp_printf(print, "result stack, most recent first\n");
     for (ssize_t i = parser->result_stack_top - 1; i >= 0; i--) {
-        mp_parse_node_print(parser->result_stack[i], 0);
+        mp_parse_node_print(print, parser->result_stack[i], 0);
     }
 }
 */
@@ -799,9 +796,11 @@ STATIC bool fold_constants(parser_t *parser, uint8_t rule_id, size_t num_args) {
 #endif
 
 STATIC void push_result_rule(parser_t *parser, size_t src_line, uint8_t rule_id, size_t num_args) {
-    // optimise away parenthesis around an expression if possible
+    // Simplify and optimise certain rules, to reduce memory usage and simplify the compiler.
     if (rule_id == RULE_atom_paren) {
-        // there should be just 1 arg for this rule
+        // Remove parenthesis around a single expression if possible.
+        // This atom_paren rule always has a single argument, and after this
+        // optimisation that argument is either NULL or testlist_comp.
         mp_parse_node_t pn = peek_result(parser, 0);
         if (MP_PARSE_NODE_IS_NULL(pn)) {
             // need to keep parenthesis for ()
@@ -811,6 +810,34 @@ STATIC void push_result_rule(parser_t *parser, size_t src_line, uint8_t rule_id,
             // parenthesis around a single expression, so it's just the expression
             return;
         }
+    } else if (rule_id == RULE_testlist_comp) {
+        // The testlist_comp rule can be the sole argument to either atom_parent
+        // or atom_bracket, for (...) and [...] respectively.
+        assert(num_args == 2);
+        mp_parse_node_t pn = peek_result(parser, 0);
+        if (MP_PARSE_NODE_IS_STRUCT(pn)) {
+            mp_parse_node_struct_t *pns = (mp_parse_node_struct_t *)pn;
+            if (MP_PARSE_NODE_STRUCT_KIND(pns) == RULE_testlist_comp_3b) {
+                // tuple of one item, with trailing comma
+                pop_result(parser);
+                --num_args;
+            } else if (MP_PARSE_NODE_STRUCT_KIND(pns) == RULE_testlist_comp_3c) {
+                // tuple of many items, convert testlist_comp_3c to testlist_comp
+                pop_result(parser);
+                assert(pn == peek_result(parser, 0));
+                pns->kind_num_nodes = rule_id | MP_PARSE_NODE_STRUCT_NUM_NODES(pns) << 8;
+                return;
+            } else if (MP_PARSE_NODE_STRUCT_KIND(pns) == RULE_comp_for) {
+                // generator expression
+            } else {
+                // tuple with 2 items
+            }
+        } else {
+            // tuple with 2 items
+        }
+    } else if (rule_id == RULE_testlist_comp_3c) {
+        // steal first arg of outer testlist_comp rule
+        ++num_args;
     }
 
     #if MICROPY_COMP_CONST_FOLDING
@@ -829,6 +856,10 @@ STATIC void push_result_rule(parser_t *parser, size_t src_line, uint8_t rule_id,
     pn->kind_num_nodes = (rule_id & 0xff) | (num_args << 8);
     for (size_t i = num_args; i > 0; i--) {
         pn->nodes[i - 1] = pop_result(parser);
+    }
+    if (rule_id == RULE_testlist_comp_3c) {
+        // need to push something non-null to replace stolen first arg of testlist_comp
+        push_result_node(parser, (mp_parse_node_t)pn);
     }
     push_result_node(parser, (mp_parse_node_t)pn);
 }
@@ -1155,6 +1186,14 @@ mp_parse_tree_t mp_parse(mp_lexer_t *lex, mp_parse_input_kind_t input_kind) {
         } else if (lex->tok_kind == MP_TOKEN_DEDENT_MISMATCH) {
             exc = mp_obj_new_exception_msg(&mp_type_IndentationError,
                 MP_ERROR_TEXT("unindent doesn't match any outer indent level"));
+        #if MICROPY_PY_FSTRINGS
+        } else if (lex->tok_kind == MP_TOKEN_MALFORMED_FSTRING) {
+            exc = mp_obj_new_exception_msg(&mp_type_SyntaxError,
+                MP_ERROR_TEXT("malformed f-string"));
+        } else if (lex->tok_kind == MP_TOKEN_FSTRING_RAW) {
+            exc = mp_obj_new_exception_msg(&mp_type_SyntaxError,
+                MP_ERROR_TEXT("raw f-strings are not supported"));
+        #endif
         } else {
             exc = mp_obj_new_exception_msg(&mp_type_SyntaxError,
                 MP_ERROR_TEXT("invalid syntax"));

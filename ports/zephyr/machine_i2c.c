@@ -37,12 +37,13 @@
 #include "py/mphal.h"
 #include "py/mperrno.h"
 #include "extmod/machine_i2c.h"
+#include "modmachine.h"
 
-STATIC const mp_obj_type_t machine_hard_i2c_type;
+#if MICROPY_PY_MACHINE_I2C
 
 typedef struct _machine_hard_i2c_obj_t {
     mp_obj_base_t base;
-    struct device *dev;
+    const struct device *dev;
     bool restart;
 } machine_hard_i2c_obj_t;
 
@@ -65,7 +66,7 @@ mp_obj_t machine_hard_i2c_make_new(const mp_obj_type_t *type, size_t n_args, siz
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     const char *dev_name = mp_obj_str_get_str(args[ARG_id].u_obj);
-    struct device *dev = device_get_binding(dev_name);
+    const struct device *dev = device_get_binding(dev_name);
 
     if (dev == NULL) {
         mp_raise_ValueError(MP_ERROR_TEXT("device not found"));
@@ -97,7 +98,7 @@ STATIC int machine_hard_i2c_transfer_single(mp_obj_base_t *self_in, uint16_t add
     struct i2c_msg msg;
     int ret;
 
-    msg.buf = (u8_t *)buf;
+    msg.buf = (uint8_t *)buf;
     msg.len = len;
     msg.flags = 0;
 
@@ -127,11 +128,13 @@ STATIC const mp_machine_i2c_p_t machine_hard_i2c_p = {
     .transfer_single = machine_hard_i2c_transfer_single,
 };
 
-STATIC const mp_obj_type_t machine_hard_i2c_type = {
+const mp_obj_type_t machine_hard_i2c_type = {
     { &mp_type_type },
     .name = MP_QSTR_I2C,
     .print = machine_hard_i2c_print,
     .make_new = machine_hard_i2c_make_new,
     .protocol = &machine_hard_i2c_p,
-    .locals_dict = (mp_obj_dict_t *)&mp_machine_soft_i2c_locals_dict,
+    .locals_dict = (mp_obj_dict_t *)&mp_machine_i2c_locals_dict,
 };
+
+#endif // MICROPY_PY_MACHINE_I2C

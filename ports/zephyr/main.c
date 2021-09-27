@@ -38,29 +38,30 @@
 #include <usb/usb_device.h>
 #endif
 
-#ifdef CONFIG_FLASH_MAP
 #include <storage/flash_map.h>
-#endif
 
 #include "py/mperrno.h"
 #include "py/compile.h"
 #include "py/runtime.h"
 #include "py/repl.h"
 #include "py/gc.h"
+#include "py/mphal.h"
 #include "py/stackctrl.h"
-#include "lib/utils/pyexec.h"
-#include "lib/mp-readline/readline.h"
+#include "shared/runtime/pyexec.h"
+#include "shared/readline/readline.h"
+#include "extmod/modbluetooth.h"
 
 #if MICROPY_VFS
 #include "extmod/vfs.h"
 #endif
 
+#include "modmachine.h"
 #include "modzephyr.h"
 
 #ifdef TEST
-#include "lib/upytesthelper/upytesthelper.h"
+#include "shared/upytesthelper/upytesthelper.h"
 #include "lib/tinytest/tinytest.c"
-#include "lib/upytesthelper/upytesthelper.c"
+#include "shared/upytesthelper/upytesthelper.c"
 #include TEST
 #endif
 
@@ -100,8 +101,8 @@ STATIC void vfs_init(void) {
     const char *mount_point_str = NULL;
     int ret = 0;
 
-    #ifdef CONFIG_DISK_ACCESS_SDHC
-    mp_obj_t args[] = { mp_obj_new_str(CONFIG_DISK_SDHC_VOLUME_NAME, strlen(CONFIG_DISK_SDHC_VOLUME_NAME)) };
+    #ifdef CONFIG_DISK_DRIVER_SDMMC
+    mp_obj_t args[] = { mp_obj_new_str(CONFIG_SDMMC_VOLUME_NAME, strlen(CONFIG_SDMMC_VOLUME_NAME)) };
     bdev = zephyr_disk_access_type.make_new(&zephyr_disk_access_type, ARRAY_SIZE(args), 0, args);
     mount_point_str = "/sd";
     #elif defined(CONFIG_FLASH_MAP) && FLASH_AREA_LABEL_EXISTS(storage)
@@ -124,6 +125,7 @@ int real_main(void) {
     mp_stack_set_limit(CONFIG_MAIN_STACK_SIZE - 512);
 
     init_zephyr();
+    mp_hal_init();
 
     #ifdef TEST
     static const char *argv[] = {"test"};
@@ -166,6 +168,14 @@ soft_reset:
     }
 
     printf("soft reboot\n");
+
+    #if MICROPY_PY_BLUETOOTH
+    mp_bluetooth_deinit();
+    #endif
+    #if MICROPY_PY_MACHINE
+    machine_pin_deinit();
+    #endif
+
     goto soft_reset;
 
     return 0;

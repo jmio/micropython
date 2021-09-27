@@ -34,7 +34,7 @@
 #include "py/runtime.h"
 #include "py/stream.h"
 #include "extmod/misc.h"
-#include "lib/utils/pyexec.h"
+#include "shared/runtime/pyexec.h"
 
 STATIC byte stdin_ringbuf_array[256];
 ringbuf_t stdin_ringbuf = {stdin_ringbuf_array, sizeof(stdin_ringbuf_array), 0, 0};
@@ -91,31 +91,8 @@ void mp_hal_debug_str(const char *str) {
 }
 #endif
 
-void mp_hal_stdout_tx_str(const char *str) {
-    mp_uos_dupterm_tx_strn(str, strlen(str));
-}
-
 void mp_hal_stdout_tx_strn(const char *str, uint32_t len) {
     mp_uos_dupterm_tx_strn(str, len);
-}
-
-void mp_hal_stdout_tx_strn_cooked(const char *str, uint32_t len) {
-    const char *last = str;
-    while (len--) {
-        if (*str == '\n') {
-            if (str > last) {
-                mp_uos_dupterm_tx_strn(last, str - last);
-            }
-            mp_uos_dupterm_tx_strn("\r\n", 2);
-            ++str;
-            last = str;
-        } else {
-            ++str;
-        }
-    }
-    if (str > last) {
-        mp_uos_dupterm_tx_strn(last, str - last);
-    }
 }
 
 void mp_hal_debug_tx_strn_cooked(void *env, const char *str, uint32_t len) {
@@ -136,6 +113,10 @@ uint32_t MP_FASTCODE(mp_hal_ticks_ms)(void) {
 
 void MP_FASTCODE(mp_hal_delay_ms)(uint32_t delay) {
     mp_hal_delay_us(delay * 1000);
+}
+
+uint64_t mp_hal_time_ns(void) {
+    return pyb_rtc_get_us_since_epoch() * 1000ULL;
 }
 
 void ets_event_poll(void) {

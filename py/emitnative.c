@@ -211,6 +211,7 @@ struct _emit_t {
     int pass;
 
     bool do_viper_types;
+    bool prelude_offset_uses_u16_encoding;
 
     mp_uint_t local_vtype_alloc;
     vtype_kind_t *local_vtype;
@@ -336,6 +337,18 @@ STATIC void emit_native_mov_reg_qstr_obj(emit_t *emit, int reg_dest, qstr qst) {
 #define emit_native_mov_state_imm_via(emit, local_num, imm, reg_temp) \
     do { \
         ASM_MOV_REG_IMM((emit)->as, (reg_temp), (imm)); \
+        emit_native_mov_state_reg((emit), (local_num), (reg_temp)); \
+    } while (false)
+
+#define emit_native_mov_state_imm_fix_u16_via(emit, local_num, imm, reg_temp) \
+    do { \
+        ASM_MOV_REG_IMM_FIX_U16((emit)->as, (reg_temp), (imm)); \
+        emit_native_mov_state_reg((emit), (local_num), (reg_temp)); \
+    } while (false)
+
+#define emit_native_mov_state_imm_fix_word_via(emit, local_num, imm, reg_temp) \
+    do { \
+        ASM_MOV_REG_IMM_FIX_WORD((emit)->as, (reg_temp), (imm)); \
         emit_native_mov_state_reg((emit), (local_num), (reg_temp)); \
     } while (false)
 
@@ -549,16 +562,27 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
             ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_FUN_OBJ(emit), REG_PARENT_ARG_1);
 
             // Set code_state.ip (offset from start of this function to prelude info)
+            int code_state_ip_local = emit->code_state_start + OFFSETOF_CODE_STATE_IP;
             #if N_PRELUDE_AS_BYTES_OBJ
             // Prelude is a bytes object in const_table; store ip = prelude->data - fun_bc->bytecode
             ASM_LOAD_REG_REG_OFFSET(emit->as, REG_LOCAL_3, REG_LOCAL_3, emit->scope->num_pos_args + emit->scope->num_kwonly_args + 1);
             ASM_LOAD_REG_REG_OFFSET(emit->as, REG_LOCAL_3, REG_LOCAL_3, offsetof(mp_obj_str_t, data) / sizeof(uintptr_t));
             ASM_LOAD_REG_REG_OFFSET(emit->as, REG_PARENT_ARG_1, REG_PARENT_ARG_1, OFFSETOF_OBJ_FUN_BC_BYTECODE);
             ASM_SUB_REG_REG(emit->as, REG_LOCAL_3, REG_PARENT_ARG_1);
-            emit_native_mov_state_reg(emit, emit->code_state_start + OFFSETOF_CODE_STATE_IP, REG_LOCAL_3);
+            emit_native_mov_state_reg(emit, code_state_ip_local, REG_LOCAL_3);
             #else
-            // TODO this encoding may change size in the final pass, need to make it fixed
-            emit_native_mov_state_imm_via(emit, emit->code_state_start + OFFSETOF_CODE_STATE_IP, emit->prelude_offset, REG_PARENT_ARG_1);
+            if (emit->pass == MP_PASS_CODE_SIZE) {
+                // Commit to the encoding size based on the value of prelude_offset in this pass.
+                // By using 32768 as the cut-off it is highly unlikely that prelude_offset will
+                // grow beyond 65535 by the end of thiss pass, and so require the larger encoding.
+                emit->prelude_offset_uses_u16_encoding = emit->prelude_offset < 32768;
+            }
+            if (emit->prelude_offset_uses_u16_encoding) {
+                assert(emit->prelude_offset <= 65535);
+                emit_native_mov_state_imm_fix_u16_via(emit, code_state_ip_local, emit->prelude_offset, REG_PARENT_ARG_1);
+            } else {
+                emit_native_mov_state_imm_fix_word_via(emit, code_state_ip_local, emit->prelude_offset, REG_PARENT_ARG_1);
+            }
             #endif
 
             // Set code_state.n_state (only works on little endian targets due to n_state being uint16_t)
@@ -817,10 +841,13 @@ STATIC void need_reg_single(emit_t *emit, int reg_needed, int skip_stack_pos) {
     }
 }
 
+// Ensures all unsettled registers that hold Python values are copied to the
+// concrete Python stack.  All registers are then free to use.
 STATIC void need_reg_all(emit_t *emit) {
     for (int i = 0; i < emit->stack_size; i++) {
         stack_info_t *si = &emit->stack_info[i];
         if (si->kind == STACK_REG) {
+            DEBUG_printf("    reg(%u) to local(%u)\n", si->data.u_reg, emit->stack_start + i);
             si->kind = STACK_VALUE;
             emit_native_mov_state_reg(emit, emit->stack_start + i, si->data.u_reg);
         }
@@ -847,23 +874,21 @@ STATIC vtype_kind_t load_reg_stack_imm(emit_t *emit, int reg_dest, const stack_i
     }
 }
 
+// Copies all unsettled registers and immediates that are Python values into the
+// concrete Python stack.  This ensures the concrete Python stack holds valid
+// values for the current stack_size.
+// This function may clobber REG_TEMP1.
 STATIC void need_stack_settled(emit_t *emit) {
     DEBUG_printf("  need_stack_settled; stack_size=%d\n", emit->stack_size);
-    for (int i = 0; i < emit->stack_size; i++) {
-        stack_info_t *si = &emit->stack_info[i];
-        if (si->kind == STACK_REG) {
-            DEBUG_printf("    reg(%u) to local(%u)\n", si->data.u_reg, emit->stack_start + i);
-            si->kind = STACK_VALUE;
-            emit_native_mov_state_reg(emit, emit->stack_start + i, si->data.u_reg);
-        }
-    }
+    need_reg_all(emit);
     for (int i = 0; i < emit->stack_size; i++) {
         stack_info_t *si = &emit->stack_info[i];
         if (si->kind == STACK_IMM) {
             DEBUG_printf("    imm(" INT_FMT ") to local(%u)\n", si->data.u_imm, emit->stack_start + i);
             si->kind = STACK_VALUE;
-            si->vtype = load_reg_stack_imm(emit, REG_TEMP0, si, false);
-            emit_native_mov_state_reg(emit, emit->stack_start + i, REG_TEMP0);
+            // using REG_TEMP1 to avoid clobbering REG_TEMP0 (aka REG_RET)
+            si->vtype = load_reg_stack_imm(emit, REG_TEMP1, si, false);
+            emit_native_mov_state_reg(emit, emit->stack_start + i, REG_TEMP1);
         }
     }
 }
@@ -1535,6 +1560,7 @@ STATIC void emit_native_load_subscr(emit_t *emit) {
             int reg_base = REG_ARG_1;
             int reg_index = REG_ARG_2;
             emit_pre_pop_reg_flexible(emit, &vtype_base, &reg_base, reg_index, reg_index);
+            need_reg_single(emit, REG_RET, 0);
             switch (vtype_base) {
                 case VTYPE_PTR8: {
                     // pointer to 8-bit memory
@@ -1598,6 +1624,7 @@ STATIC void emit_native_load_subscr(emit_t *emit) {
             int reg_index = REG_ARG_2;
             emit_pre_pop_reg_flexible(emit, &vtype_index, &reg_index, REG_ARG_1, REG_ARG_1);
             emit_pre_pop_reg(emit, &vtype_base, REG_ARG_1);
+            need_reg_single(emit, REG_RET, 0);
             if (vtype_index != VTYPE_INT && vtype_index != VTYPE_UINT) {
                 EMIT_NATIVE_VIPER_TYPE_ERROR(emit,
                     MP_ERROR_TEXT("can't load with '%q' index"), vtype_to_qstr(vtype_index));
@@ -1745,7 +1772,7 @@ STATIC void emit_native_store_subscr(emit_t *emit) {
             int reg_index = REG_ARG_2;
             int reg_value = REG_ARG_3;
             emit_pre_pop_reg_flexible(emit, &vtype_base, &reg_base, reg_index, reg_value);
-            #if N_X86
+            #if N_X64 || N_X86
             // special case: x86 needs byte stores to be from lower 4 regs (REG_ARG_3 is EDX)
             emit_pre_pop_reg(emit, &vtype_value, reg_value);
             #else
@@ -1832,7 +1859,7 @@ STATIC void emit_native_store_subscr(emit_t *emit) {
                 EMIT_NATIVE_VIPER_TYPE_ERROR(emit,
                     MP_ERROR_TEXT("can't store with '%q' index"), vtype_to_qstr(vtype_index));
             }
-            #if N_X86
+            #if N_X64 || N_X86
             // special case: x86 needs byte stores to be from lower 4 regs (REG_ARG_3 is EDX)
             emit_pre_pop_reg(emit, &vtype_value, reg_value);
             #else
@@ -2289,7 +2316,8 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
     DEBUG_printf("binary_op(" UINT_FMT ")\n", op);
     vtype_kind_t vtype_lhs = peek_vtype(emit, 1);
     vtype_kind_t vtype_rhs = peek_vtype(emit, 0);
-    if (vtype_lhs == VTYPE_INT && vtype_rhs == VTYPE_INT) {
+    if ((vtype_lhs == VTYPE_INT || vtype_lhs == VTYPE_UINT)
+        && (vtype_rhs == VTYPE_INT || vtype_rhs == VTYPE_UINT)) {
         // for integers, inplace and normal ops are equivalent, so use just normal ops
         if (MP_BINARY_OP_INPLACE_OR <= op && op <= MP_BINARY_OP_INPLACE_POWER) {
             op += MP_BINARY_OP_OR - MP_BINARY_OP_INPLACE_OR;
@@ -2306,9 +2334,13 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
             if (op == MP_BINARY_OP_LSHIFT) {
                 ASM_LSL_REG(emit->as, REG_RET);
             } else {
-                ASM_ASR_REG(emit->as, REG_RET);
+                if (vtype_lhs == VTYPE_UINT) {
+                    ASM_LSR_REG(emit->as, REG_RET);
+                } else {
+                    ASM_ASR_REG(emit->as, REG_RET);
+                }
             }
-            emit_post_push_reg(emit, VTYPE_INT, REG_RET);
+            emit_post_push_reg(emit, vtype_lhs, REG_RET);
             return;
         }
         #endif
@@ -2316,6 +2348,10 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
         // special cases for floor-divide and module because we dispatch to helper functions
         if (op == MP_BINARY_OP_FLOOR_DIVIDE || op == MP_BINARY_OP_MODULO) {
             emit_pre_pop_reg_reg(emit, &vtype_rhs, REG_ARG_2, &vtype_lhs, REG_ARG_1);
+            if (vtype_lhs != VTYPE_INT) {
+                EMIT_NATIVE_VIPER_TYPE_ERROR(emit,
+                    MP_ERROR_TEXT("div/mod not implemented for uint"), mp_binary_op_method_name[op]);
+            }
             if (op == MP_BINARY_OP_FLOOR_DIVIDE) {
                 emit_call(emit, MP_F_SMALL_INT_FLOOR_DIVIDE);
             } else {
@@ -2334,31 +2370,35 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
             if (op == MP_BINARY_OP_LSHIFT) {
                 ASM_LSL_REG_REG(emit->as, REG_ARG_2, reg_rhs);
             } else {
-                ASM_ASR_REG_REG(emit->as, REG_ARG_2, reg_rhs);
+                if (vtype_lhs == VTYPE_UINT) {
+                    ASM_LSR_REG_REG(emit->as, REG_ARG_2, reg_rhs);
+                } else {
+                    ASM_ASR_REG_REG(emit->as, REG_ARG_2, reg_rhs);
+                }
             }
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
             return;
         }
         #endif
 
         if (op == MP_BINARY_OP_OR) {
             ASM_OR_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (op == MP_BINARY_OP_XOR) {
             ASM_XOR_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (op == MP_BINARY_OP_AND) {
             ASM_AND_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (op == MP_BINARY_OP_ADD) {
             ASM_ADD_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (op == MP_BINARY_OP_SUBTRACT) {
             ASM_SUB_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (op == MP_BINARY_OP_MULTIPLY) {
             ASM_MUL_REG_REG(emit->as, REG_ARG_2, reg_rhs);
-            emit_post_push_reg(emit, VTYPE_INT, REG_ARG_2);
+            emit_post_push_reg(emit, vtype_lhs, REG_ARG_2);
         } else if (MP_BINARY_OP_LESS <= op && op <= MP_BINARY_OP_NOT_EQUAL) {
             // comparison ops are (in enum order):
             //  MP_BINARY_OP_LESS
@@ -2367,11 +2407,26 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
             //  MP_BINARY_OP_LESS_EQUAL
             //  MP_BINARY_OP_MORE_EQUAL
             //  MP_BINARY_OP_NOT_EQUAL
+
+            if (vtype_lhs != vtype_rhs) {
+                EMIT_NATIVE_VIPER_TYPE_ERROR(emit, MP_ERROR_TEXT("comparison of int and uint"));
+            }
+
+            size_t op_idx = op - MP_BINARY_OP_LESS + (vtype_lhs == VTYPE_UINT ? 0 : 6);
+
             need_reg_single(emit, REG_RET, 0);
             #if N_X64
             asm_x64_xor_r64_r64(emit->as, REG_RET, REG_RET);
             asm_x64_cmp_r64_with_r64(emit->as, reg_rhs, REG_ARG_2);
-            static byte ops[6] = {
+            static byte ops[6 + 6] = {
+                // unsigned
+                ASM_X64_CC_JB,
+                ASM_X64_CC_JA,
+                ASM_X64_CC_JE,
+                ASM_X64_CC_JBE,
+                ASM_X64_CC_JAE,
+                ASM_X64_CC_JNE,
+                // signed
                 ASM_X64_CC_JL,
                 ASM_X64_CC_JG,
                 ASM_X64_CC_JE,
@@ -2379,11 +2434,19 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
                 ASM_X64_CC_JGE,
                 ASM_X64_CC_JNE,
             };
-            asm_x64_setcc_r8(emit->as, ops[op - MP_BINARY_OP_LESS], REG_RET);
+            asm_x64_setcc_r8(emit->as, ops[op_idx], REG_RET);
             #elif N_X86
             asm_x86_xor_r32_r32(emit->as, REG_RET, REG_RET);
             asm_x86_cmp_r32_with_r32(emit->as, reg_rhs, REG_ARG_2);
-            static byte ops[6] = {
+            static byte ops[6 + 6] = {
+                // unsigned
+                ASM_X86_CC_JB,
+                ASM_X86_CC_JA,
+                ASM_X86_CC_JE,
+                ASM_X86_CC_JBE,
+                ASM_X86_CC_JAE,
+                ASM_X86_CC_JNE,
+                // signed
                 ASM_X86_CC_JL,
                 ASM_X86_CC_JG,
                 ASM_X86_CC_JE,
@@ -2391,24 +2454,62 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
                 ASM_X86_CC_JGE,
                 ASM_X86_CC_JNE,
             };
-            asm_x86_setcc_r8(emit->as, ops[op - MP_BINARY_OP_LESS], REG_RET);
+            asm_x86_setcc_r8(emit->as, ops[op_idx], REG_RET);
             #elif N_THUMB
             asm_thumb_cmp_rlo_rlo(emit->as, REG_ARG_2, reg_rhs);
-            static uint16_t ops[6] = {
-                ASM_THUMB_OP_ITE_GE,
+            #if MICROPY_EMIT_THUMB_ARMV7M
+            static uint16_t ops[6 + 6] = {
+                // unsigned
+                ASM_THUMB_OP_ITE_CC,
+                ASM_THUMB_OP_ITE_HI,
+                ASM_THUMB_OP_ITE_EQ,
+                ASM_THUMB_OP_ITE_LS,
+                ASM_THUMB_OP_ITE_CS,
+                ASM_THUMB_OP_ITE_NE,
+                // signed
+                ASM_THUMB_OP_ITE_LT,
                 ASM_THUMB_OP_ITE_GT,
                 ASM_THUMB_OP_ITE_EQ,
-                ASM_THUMB_OP_ITE_GT,
+                ASM_THUMB_OP_ITE_LE,
                 ASM_THUMB_OP_ITE_GE,
-                ASM_THUMB_OP_ITE_EQ,
+                ASM_THUMB_OP_ITE_NE,
             };
-            static byte ret[6] = { 0, 1, 1, 0, 1, 0, };
-            asm_thumb_op16(emit->as, ops[op - MP_BINARY_OP_LESS]);
-            asm_thumb_mov_rlo_i8(emit->as, REG_RET, ret[op - MP_BINARY_OP_LESS]);
-            asm_thumb_mov_rlo_i8(emit->as, REG_RET, ret[op - MP_BINARY_OP_LESS] ^ 1);
+            asm_thumb_op16(emit->as, ops[op_idx]);
+            asm_thumb_mov_rlo_i8(emit->as, REG_RET, 1);
+            asm_thumb_mov_rlo_i8(emit->as, REG_RET, 0);
+            #else
+            static uint16_t ops[6 + 6] = {
+                // unsigned
+                ASM_THUMB_CC_CC,
+                ASM_THUMB_CC_HI,
+                ASM_THUMB_CC_EQ,
+                ASM_THUMB_CC_LS,
+                ASM_THUMB_CC_CS,
+                ASM_THUMB_CC_NE,
+                // signed
+                ASM_THUMB_CC_LT,
+                ASM_THUMB_CC_GT,
+                ASM_THUMB_CC_EQ,
+                ASM_THUMB_CC_LE,
+                ASM_THUMB_CC_GE,
+                ASM_THUMB_CC_NE,
+            };
+            asm_thumb_bcc_rel9(emit->as, ops[op_idx], 6);
+            asm_thumb_mov_rlo_i8(emit->as, REG_RET, 0);
+            asm_thumb_b_rel12(emit->as, 4);
+            asm_thumb_mov_rlo_i8(emit->as, REG_RET, 1);
+            #endif
             #elif N_ARM
             asm_arm_cmp_reg_reg(emit->as, REG_ARG_2, reg_rhs);
-            static uint ccs[6] = {
+            static uint ccs[6 + 6] = {
+                // unsigned
+                ASM_ARM_CC_CC,
+                ASM_ARM_CC_HI,
+                ASM_ARM_CC_EQ,
+                ASM_ARM_CC_LS,
+                ASM_ARM_CC_CS,
+                ASM_ARM_CC_NE,
+                // signed
                 ASM_ARM_CC_LT,
                 ASM_ARM_CC_GT,
                 ASM_ARM_CC_EQ,
@@ -2416,9 +2517,17 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
                 ASM_ARM_CC_GE,
                 ASM_ARM_CC_NE,
             };
-            asm_arm_setcc_reg(emit->as, REG_RET, ccs[op - MP_BINARY_OP_LESS]);
+            asm_arm_setcc_reg(emit->as, REG_RET, ccs[op_idx]);
             #elif N_XTENSA || N_XTENSAWIN
-            static uint8_t ccs[6] = {
+            static uint8_t ccs[6 + 6] = {
+                // unsigned
+                ASM_XTENSA_CC_LTU,
+                0x80 | ASM_XTENSA_CC_LTU, // for GTU we'll swap args
+                ASM_XTENSA_CC_EQ,
+                0x80 | ASM_XTENSA_CC_GEU, // for LEU we'll swap args
+                ASM_XTENSA_CC_GEU,
+                ASM_XTENSA_CC_NE,
+                // signed
                 ASM_XTENSA_CC_LT,
                 0x80 | ASM_XTENSA_CC_LT, // for GT we'll swap args
                 ASM_XTENSA_CC_EQ,
@@ -2426,7 +2535,7 @@ STATIC void emit_native_binary_op(emit_t *emit, mp_binary_op_t op) {
                 ASM_XTENSA_CC_GE,
                 ASM_XTENSA_CC_NE,
             };
-            uint8_t cc = ccs[op - MP_BINARY_OP_LESS];
+            uint8_t cc = ccs[op_idx];
             if ((cc & 0x80) == 0) {
                 asm_xtensa_setcc_reg_reg_reg(emit->as, cc, REG_RET, REG_ARG_2, reg_rhs);
             } else {

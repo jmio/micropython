@@ -38,7 +38,7 @@
 #include "py/stackctrl.h"
 #include "py/gc.h"
 #include "py/compile.h"
-#include "lib/utils/pyexec.h"
+#include "shared/runtime/pyexec.h"
 #include "readline.h"
 #include "gccollect.h"
 #include "modmachine.h"
@@ -52,6 +52,8 @@
 #include "i2c.h"
 #include "adc.h"
 #include "rtcounter.h"
+#include "mphalport.h"
+
 #if MICROPY_PY_MACHINE_HW_PWM
 #include "pwm.h"
 #endif
@@ -72,6 +74,13 @@
 
 #if MICROPY_HW_USB_CDC
 #include "usb_cdc.h"
+#endif
+
+#if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
+#include "extmod/vfs_fat.h"
+#include "lib/oofatfs/ff.h"
+#include "extmod/vfs.h"
+#include "flashbdev.h"
 #endif
 
 void do_str(const char *src, mp_parse_input_kind_t input_kind) {
@@ -97,10 +106,35 @@ void do_str(const char *src, mp_parse_input_kind_t input_kind) {
 extern uint32_t _heap_start;
 extern uint32_t _heap_end;
 
+#if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
+STATIC int vfs_mount_and_chdir(mp_obj_t bdev, mp_obj_t mount_point) {
+    nlr_buf_t nlr;
+    mp_int_t ret = -MP_EIO;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t args[] = { bdev, mount_point };
+        mp_vfs_mount(2, args, (mp_map_t *)&mp_const_empty_map);
+        mp_vfs_chdir(mount_point);
+        ret = 0; // success
+        nlr_pop();
+    } else {
+        mp_obj_base_t *exc = nlr.ret_val;
+        if (mp_obj_is_subclass_fast(MP_OBJ_FROM_PTR(exc->type), MP_OBJ_FROM_PTR(&mp_type_OSError))) {
+            mp_obj_t v = mp_obj_exception_get_value(MP_OBJ_FROM_PTR(exc));
+            mp_obj_get_int_maybe(v, &ret); // get errno value
+            ret = -ret;
+        }
+    }
+    return ret;
+}
+#endif
+
 int main(int argc, char **argv) {
 
 
 soft_reset:
+    #if MICROPY_PY_TIME_TICKS
+    rtc1_init_time_ticks();
+    #endif
 
     led_init();
 
@@ -163,6 +197,23 @@ soft_reset:
     #endif
 
     pin_init0();
+
+    #if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
+    flashbdev_init();
+
+    // Try to mount the flash on "/flash" and chdir to it for the boot-up directory.
+    mp_obj_t mount_point = MP_OBJ_NEW_QSTR(MP_QSTR__slash_flash);
+    int ret = vfs_mount_and_chdir((mp_obj_t)&nrf_flash_obj, mount_point);
+
+    if ((ret == -MP_ENODEV) || (ret == -MP_EIO)) {
+        pyexec_frozen_module("_mkfs.py"); // Frozen script for formatting flash filesystem.
+        ret = vfs_mount_and_chdir((mp_obj_t)&nrf_flash_obj, mount_point);
+    }
+
+    if (ret != 0) {
+        printf("MPY: can't mount flash\n");
+    }
+    #endif
 
     #if MICROPY_MBFS
     microbit_filesystem_init();
@@ -275,10 +326,10 @@ mp_import_stat_t mp_import_stat(const char *path) {
     return uos_mbfs_import_stat(path);
 }
 
-STATIC mp_obj_t mp_builtin_open(size_t n_args, const mp_obj_t *args) {
+mp_obj_t mp_builtin_open(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
     return uos_mbfs_open(n_args, args);
 }
-MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mp_builtin_open_obj, 1, 2, mp_builtin_open);
+MP_DEFINE_CONST_FUN_OBJ_KW(mp_builtin_open_obj, 1, mp_builtin_open);
 
 #else
 // use dummy functions - no filesystem available
@@ -290,7 +341,7 @@ mp_import_stat_t mp_import_stat(const char *path) {
     return MP_IMPORT_STAT_NO_EXIST;
 }
 
-STATIC mp_obj_t mp_builtin_open(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
+mp_obj_t mp_builtin_open(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
     mp_raise_OSError(MP_EPERM);
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(mp_builtin_open_obj, 1, mp_builtin_open);

@@ -34,8 +34,8 @@
 #if MICROPY_PY_UBINASCII
 
 STATIC mp_obj_t mod_binascii_hexlify(size_t n_args, const mp_obj_t *args) {
-    // Second argument is for an extension to allow a separator to be used
-    // between values.
+    // First argument is the data to convert.
+    // Second argument is an optional separator to be used between values.
     const char *sep = NULL;
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[0], &bufinfo, MP_BUFFER_READ);
@@ -218,7 +218,7 @@ STATIC mp_obj_t mod_binascii_b2a_base64(mp_obj_t data) {
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(mod_binascii_b2a_base64_obj, mod_binascii_b2a_base64);
 
 #if MICROPY_PY_UBINASCII_CRC32
-#include "uzlib/tinf.h"
+#include "lib/uzlib/tinf.h"
 
 STATIC mp_obj_t mod_binascii_crc32(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t bufinfo;
